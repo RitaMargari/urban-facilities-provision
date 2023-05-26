@@ -3,7 +3,15 @@ import geopandas as gpd
 import numpy as np
 import networkit as nk
 import shapely
+import geopandas as gpd
+import shapely
+import copy
+import pandas as pd
+import shapely.wkt
+import networkx as nx
+import networkit as nk
 
+from scipy import spatial
 from shapely.geometry import LineString
 
 
@@ -57,10 +65,28 @@ def get_nk_distances(nk_dists, loc):
     distances = [nk_dists.getDistance(source_node, node) for node in target_nodes]
     return pd.Series(data = distances, index = target_nodes)
 
+"""Function to convert geometry of nodes / edges from str format to shapely.geometry object"""
+
+def load_graph_geometry(G_nx, node=True, edge=False):
+
+    if edge:
+        for u, v, data in G_nx.edges(data=True):
+            data["geometry"] = shapely.wkt.loads(data["geometry"])
+    if node:
+        for u, data in G_nx.nodes(data=True):
+            data["geometry"] = shapely.geometry.Point([data["x"], data["y"]])
+
+    return G_nx
+
 
 """Functions to calculate distance matrix with road network"""
 
-def calculate_distance_matrix(network, houses, facilities, crs=32636):
+def calculate_distance_matrix(road_network, houses, facilities, crs=32636):
+
+    network = road_network.edge_subgraph(
+    [(u, v, k) for u, v, k, d in road_network.edges(data=True, keys=True) 
+    if d["type"] == "walk"]
+    )
 
     # find nearest points to objects on road network
     gdf = gpd.GeoDataFrame.from_dict(dict(network.nodes(data=True)), orient='index')
@@ -87,9 +113,19 @@ def calculate_distance_matrix(network, houses, facilities, crs=32636):
     distance_matrix.columns = list(houses.iloc[from_houses[0][0]].index)
     
     del splited_matrix
+
+    # replace 0 values (caused by road network sparsity) to euclidian distance between two points
+    distance_matrix = distance_matrix.progress_apply(lambda x: calculate_euclidian_distance(x, houses, facilities))
     return distance_matrix
 
-
+def calculate_euclidian_distance(loc, houses, facilities):
+    s = copy.deepcopy(loc)
+    s_0 = s[s == 0]
+    if len(s_0) > 0:
+        s.loc[s_0.index] = facilities["geometry"][s.index].distance(houses["geometry"][s.name])
+        return s
+    else:
+        return s
     
 """Functions to transform OD matrix to links with geometry field"""
 
@@ -115,3 +151,56 @@ def od_matrix_to_links(od_matrix, destination_matrix, houses, facilities):
     edges = od_matrix.progress_apply(lambda loc: build_edges(loc, facilities, houses, destination_matrix))
     edges = pd.concat(list(edges.iloc[0].dropna()))
     return edges
+
+
+def get_accessibility_isochrone(mobility_graph, travel_type, x_from, y_from, weight_value, weight_type, crs):
+    
+    edge_types = {
+            "public_transport": ["subway", "bus", "tram", "trolleybus", "walk"],
+            "walk": ["walk"], 
+            "drive": ["car"]
+            }
+
+    travel_names = {
+            "public_transport": "Общественный транспорт",
+            "walk": "Пешком", 
+            "drive": "Личный транспорт"
+        }
+    
+    walk_speed = 4 * 1000 / 60
+
+    mobility_graph = mobility_graph.edge_subgraph(
+        [(u, v, k) for u, v, k, d in mobility_graph.edges(data=True, keys=True) 
+        if d["type"] in edge_types[travel_type]]
+        )
+    nodes_data = pd.DataFrame.from_records(
+        [d for u, d in mobility_graph.nodes(data=True)], index=list(mobility_graph.nodes())
+        ).sort_index()
+
+    distance, start_node = spatial.KDTree(nodes_data[["x", "y"]]).query([x_from, y_from])
+    start_node = nodes_data.iloc[start_node].name
+    margin_weight = distance / walk_speed if weight_type == "time_min" else distance
+    weight_value_remain = weight_value - margin_weight
+
+    weights_sum = nx.single_source_dijkstra_path_length(
+        mobility_graph, start_node, cutoff=weight_value_remain, weight=weight_type)
+    nodes_data = nodes_data.loc[list(weights_sum.keys())].reset_index()
+    nodes_data = gpd.GeoDataFrame(nodes_data, crs=crs)
+
+    if travel_type == "public_transport" and weight_type == "time_min":
+        # 0.8 is routes curvature coefficient 
+        distance = dict((k, (weight_value_remain - v) * walk_speed * 0.8) for k, v in weights_sum.items())
+        nodes_data["left_distance"] = distance.values()
+        isochrone_geom = nodes_data["geometry"].buffer(nodes_data["left_distance"])
+        isochrone_geom = isochrone_geom.unary_union
+    
+    else:
+        distance = dict((k, (weight_value_remain - v)) for k, v in weights_sum.items())
+        nodes_data["left_distance"] = distance.values()
+        isochrone_geom = shapely.geometry.MultiPoint(nodes_data["geometry"].tolist()).convex_hull
+
+    isochrone = gpd.GeoDataFrame(
+            {"travel_type": [travel_names[travel_type]], "weight_type": [weight_type], 
+            "weight_value": [weight_value], "geometry": [isochrone_geom]}).set_crs(crs).to_crs(4326)
+
+    return isochrone
