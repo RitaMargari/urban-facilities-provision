@@ -204,3 +204,29 @@ def get_accessibility_isochrone(mobility_graph, travel_type, x_from, y_from, wei
             "weight_value": [weight_value], "geometry": [isochrone_geom]}).set_crs(crs).to_crs(4326)
 
     return isochrone
+
+
+"""Function to transfrom OD and DM matrix to nx graph"""
+
+def create_links(s, OD, dist_limit):
+    edges_within = s[s <= dist_limit]
+    edges_within_id = list(edges_within.index)
+    if len(edges_within_id) > 0:
+        edges_within_dist = list(edges_within)
+        edges_within_flows = OD[s.name].loc[edges_within_id]
+        ebunch = [(s.name, v, {"distance": d, "flows": f}) for v, d, f in zip(
+            edges_within_id, edges_within_dist, edges_within_flows
+            )]
+        return ebunch
+    else: 
+        return None
+
+def dfs2nx(DM, OD, houses, facilities, dist_limit):
+    graph = nx.DiGraph()
+    ebunch = DM.progress_apply(lambda s: create_links(s, OD, dist_limit)).dropna().explode().to_list()
+    h_nodes = houses.apply(lambda x: {"value": x.demand, "type": 1, "geometry": str(x.geometry)}, axis=1).to_dict()
+    f_nodes = facilities.apply(lambda x: {"value": x.capacity, "type": 0, "geometry": str(x.geometry)}, axis=1).to_dict()
+    graph.add_edges_from(ebunch)
+    nx.set_node_attributes(graph, h_nodes)
+    nx.set_node_attributes(graph, f_nodes)
+    return graph
