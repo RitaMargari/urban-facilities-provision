@@ -1,6 +1,11 @@
+import math
+import torch
+import torch.optim as optim
 import torch.nn.functional as F
 import torch.nn as nn
-import torch
+import numpy as np
+
+from metrics import r2_loss, weighted_mse_loss
 
 # torch.manual_seed(0)
 
@@ -35,8 +40,7 @@ class FNN_v1(nn.Module):
 
     def forward(self, data):
 
-        x_s, x_t, edge_index, edge_weight = data.x_s, data.x_t, data.edge_index, data.edge_attr
-        edge_weight = edge_weight.unsqueeze(-1)
+        x_s, x_t, edge_index, edge_weight = data.x_s, data.x_t, data.edge_index, data.edge_attr.unsqueeze(-1)
 
         x_s_d = x_s[:, 1][edge_index[0]].unsqueeze(1)
         x_s_c = x_t[:, 1][edge_index[1]].unsqueeze(1)
@@ -83,8 +87,7 @@ class FNN_v2(nn.Module):
 
     def forward(self, data):
 
-        x_s, x_t, edge_index, edge_weight = data.x_s, data.x_t, data.edge_index, data.edge_attr
-        edge_weight = edge_weight.unsqueeze(-1)
+        x_s, x_t, edge_index, edge_weight = data.x_s, data.x_t, data.edge_index, data.edge_attr.unsqueeze(-1)
 
         x_s_d = x_s[:, 1][edge_index[0]].unsqueeze(1)
         x_s_c = x_t[:, 1][edge_index[1]].unsqueeze(1)
@@ -106,3 +109,60 @@ class FNN_v2(nn.Module):
         y = y * coef
 
         return y
+
+
+def train_func(fnn_model, train_loader, valid_loader, epochs, writer=None, output=False):
+
+    optimize = optim.Adam(list(fnn_model.parameters()),  lr=0.001)
+    # scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimize, factor=0.9, min_lr=0.0001)
+
+    # train
+    for epoch in range(epochs + 1):
+        train_loss = []
+        train_r2 = []
+        for train_data in train_loader:
+
+            optimize.zero_grad()
+            fnn_model.train()
+            predict_y = fnn_model(train_data)
+
+            loss_weight = torch.log(math.e + train_data.edge_attr)
+            loss = weighted_mse_loss(predict_y, train_data.y, loss_weight)
+            r2 = r2_loss(predict_y, train_data.y)
+            train_loss.append(loss)
+            train_r2.append(r2)
+
+            loss.backward()
+            optimize.step()
+
+        t_metrics = {"train_loss": sum(train_loss)/len(train_loss), "train_r2": sum(train_r2)/len(train_r2)}        
+
+        if epoch % 10 == 0:
+            v_metrics = val_func(valid_loader, fnn_model)
+            # scheduler.step(v_metrics["valid_loss"])
+
+            if output: print(
+                "Epoch {}. TRAIN: loss {:.4f}, r2: {:.4f}. ".format(epoch, t_metrics["train_loss"], t_metrics["train_r2"]) + \
+                "VALIDATION loss: {:.4f}, r2: {:.4f}. ".format(v_metrics["valid_loss"],  v_metrics["valid_r2"]) + \
+                "Lr: {:.5f}".format(optimize.param_groups[0]["lr"]), 
+            )
+            if writer: 
+                for name, v_metric in v_metrics.items(): writer.add_scalar(name, v_metric, epoch)
+                for name, v_metric in t_metrics.items(): writer.add_scalar(name, v_metric, epoch)
+            # save_ckp(epoch, fnn_model, optimize, datetime_now + f"_epoch_{epoch}", f_path=path)
+
+    return fnn_model
+
+
+def val_func(valid_loader, fnn_model):
+
+    valid_loss = []
+    valid_r2 = []
+    for valid_data in valid_loader:
+        with torch.no_grad():
+            fnn_model.eval()
+            predict_y = fnn_model(valid_data)
+            valid_loss.append(F.mse_loss(predict_y, valid_data.y))
+            valid_r2.append(r2_loss(predict_y, valid_data.y))
+
+    return {"valid_loss": np.mean(valid_loss), "valid_r2": np.mean(valid_r2)}

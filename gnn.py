@@ -1,195 +1,285 @@
-import geopandas as gpd
-import pandas as pd
+import torch_geometric.nn as pyg_nn
 import numpy as np
-import networkx as nx
+import math
 
-from tqdm import tqdm
-from torch_geometric.data import InMemoryDataset
-from torch_geometric.data import Data
-import os
+import torch.nn.functional as F
+import torch.optim as optim
+import torch.nn as nn
 import torch
 
+from metrics import r2_loss, weighted_mse_loss
 
-class BipartiteData(Data):
-    def __init__(self, x_s=None, x_t=None, edge_index=None, y=None, edge_attr=None):
-        super().__init__()
-        self.x_s = x_s
-        self.x_t = x_t
-        self.edge_index = edge_index
-        self.edge_attr = edge_attr
-        self.y = y
+class GNNStack(nn.Module):
+    def __init__(self, input_dim, hidden_dim, dropout, heads=3, aggr=None):
+        super(GNNStack, self).__init__()
 
-    def __inc__(self, key, value, *args, **kwargs):
-        if key == 'edge_index':
-            return torch.tensor([[self.x_s.size(0)], [self.x_t.size(0)]])
-        else:
-            return super().__inc__(key, value, *args, **kwargs)
-            
-    @property
-    def num_nodes(self):
-        return self.x_s.size(0) + self.x_t.size(1)
+        self.num_layers = 2
+        self.dropout = dropout
 
+        self.norm = nn.ModuleList([nn.LayerNorm(hidden_dim * heads),  nn.LayerNorm(hidden_dim)])
+        self.kwargs = {"heads": heads, "flow": "source_to_target", "edge_dim": 1, "add_self_loops": False}
+        self.convs = nn.ModuleList([
+            pyg_nn.GATConv(input_dim, hidden_dim, **self.kwargs),
+            pyg_nn.GATConv((hidden_dim * heads, hidden_dim * heads), hidden_dim, **self.kwargs, concat=False)
+            ])
 
-class ProvisionSparseDataset(InMemoryDataset):
-    def __init__(self, root, transform=None):
-        super(ProvisionSparseDataset, self).__init__(root, transform)
-        self.data, self.slices = torch.load(self.processed_paths[0])
-
-    @property
-    def raw_file_names(self):
-        files = []
-        for file in os.listdir(self.root):
-            if file.endswith(".graphml"):
-                files.append(file)
-        return files
-        
-    @property
-    def processed_file_names(self):
-        return ['provision.dataset']
-
-    def download(self):
-        pass
+    def forward(self, data):
+        x_s, x_t, edge_index, edge_weight = data.x_s, data.x_t, data.edge_index, data.edge_attr.unsqueeze(-1)
+        edge_index_reverse = torch.concat((edge_index[1].unsqueeze(1), edge_index[0].unsqueeze(1)), 1).T
     
-    def process(self):
+        for i in range(self.num_layers):
 
-        f = 4
+            kwargs_st = {"size": (x_s.size(0), x_t.size(0)), "return_attention_weights": True}
+            kwargs_ts = {"size": (x_t.size(0), x_s.size(0)), "return_attention_weights": True}
+            x_new_t, at_t = self.convs[i]((x_s, x_t), edge_index, edge_weight, **kwargs_st)
+            x_new_s, at_s = self.convs[i]((x_t, x_s), edge_index_reverse, edge_weight, **kwargs_ts)
+
+            x_t = F.leaky_relu(x_new_t)
+            x_t = F.dropout(x_t, p=self.dropout, training=self.training)
+            x_t = self.norm[i](x_t)
+
+            x_s = F.leaky_relu(x_new_s)
+            x_s = F.dropout(x_s, p=self.dropout, training=self.training)
+            x_s = self.norm[i](x_s)
+
+        return x_s, at_s, x_t, at_t
+
+
+class FNNStack_v1(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers, dropout):
+        super(FNNStack_v1, self).__init__()
+
+        self.num_layers = num_layers
+        self.dropout = dropout
+
+        self.lins = nn.ModuleList()
+        self.lins.append(nn.Linear(input_dim, hidden_dim))
+        for _ in range(self.num_layers - 2):
+            self.lins.append(nn.Linear(hidden_dim, hidden_dim))
+        self.lins.append(nn.Linear(hidden_dim, output_dim))
+
+        self.norm = nn.ModuleList()
+        for l in range(self.num_layers):
+            self.norm.append(nn.LayerNorm(hidden_dim))
+
+    def normalize(self, x_s, x_t, edge_index, y):
+
+        y_sum_i = torch.zeros_like(x_s[:, 1], dtype=y.dtype).index_add_(0, edge_index[0], y)
+        y_norm_i = y * x_s[:, 1][edge_index[0, :]] / (y_sum_i[edge_index[0]] + 3.4028e-38)
+        y_sum_j = torch.zeros_like(x_t[:, 1], dtype=y.dtype).index_add_(0, edge_index[1], y)
+        y_norm_j = y * x_t[:, 1][edge_index[1, :]] / (y_sum_j[edge_index[1]] + 3.4028e-38)
+
+        y_new = torch.min(y_norm_i, y_norm_j)
+        return y_new
+
+    def forward(self, emb_s, emb_t, at_s, at_t, data):
+
+        x_s, x_t, edge_index, edge_weight = data.x_s, data.x_t, data.edge_index, data.edge_attr.unsqueeze(-1)
+
+        x_s_d = x_s[:, 1][edge_index[0]].unsqueeze(1)
+        x_s_c = x_t[:, 1][edge_index[1]].unsqueeze(1)
+        emb_s = emb_s[edge_index[0]]
+        emb_t = emb_t[edge_index[1]]
+        atten_s = at_s[1].mean(1).unsqueeze(-1)
+        atten_t = at_t[1].mean(1).unsqueeze(-1)
+
+        y = torch.cat((emb_s, emb_t, x_s_d, x_s_c, atten_s, atten_t, edge_weight), axis=1)
+        for i in range(self.num_layers - 1):
+            y = self.lins[i](y) 
+            y = nn.functional.leaky_relu(y)
+            y = F.dropout(y, p=self.dropout, training=self.training)
+            y = self.norm[i](y)
+
+        y = self.lins[-1](y)
+        y = torch.relu(y).squeeze()
+        y_norm = self.normalize(x_s, x_t, edge_index, y)
+        return y_norm
+
+
+class FNNStack_v2(nn.Module):
+    def __init__(self, input_dim, hidden_dim_1, hidden_dim_2, output_dim, num_layers, dropout):
+        super(FNNStack_v2, self).__init__()
+
+        self.num_layers = num_layers
+        self.dropout = dropout
+
+        self.lins = nn.ModuleList()
+        self.lins.append(nn.Linear(input_dim, hidden_dim_1))
+        for _ in range(self.num_layers - 2):
+            self.lins.append(nn.Linear(hidden_dim_1, hidden_dim_1))
+        self.lins.append(nn.Linear(hidden_dim_1, output_dim))
+
+        self.norm = nn.ModuleList()
+        for l in range(self.num_layers):
+            self.norm.append(nn.LayerNorm(hidden_dim_1))
+
+        self.factors_model = nn.Sequential(
+          nn.Linear(5, hidden_dim_2),
+          nn.ReLU(),
+          nn.Dropout(p=self.dropout),
+          nn.LayerNorm(hidden_dim_2),
+          nn.Linear(hidden_dim_2, 1),
+          nn.ReLU()
+        )
+
+    def normalize_y(self, x_s, x_t, edge_index, y):
+
+        y_sum_i = torch.zeros_like(x_s[:, 1], dtype=y.dtype).index_add_(0, edge_index[0], y)
+        y_norm_i = y * x_s[:, 1][edge_index[0, :]] / (y_sum_i[edge_index[0]] + 3.4028e-38)
+        y_sum_j = torch.zeros_like(x_t[:, 1], dtype=y.dtype).index_add_(0, edge_index[1], y)
+        y_norm_j = y * x_t[:, 1][edge_index[1, :]] / (y_sum_j[edge_index[1]] + 3.4028e-38)
+
+        y_new = torch.min(y_norm_i, y_norm_j)
+        return y_new
+    
+    def forward(self, emb_s, emb_t, at_s, at_t, data):
+
+        x_s, x_t, edge_index, edge_weight = data.x_s, data.x_t, data.edge_index, data.edge_attr.unsqueeze(-1)
+
+        x_s_d = x_s[:, 1][edge_index[0]].unsqueeze(1)
+        x_s_c = x_t[:, 1][edge_index[1]].unsqueeze(1)
+        emb_s = emb_s[edge_index[0]]
+        emb_t = emb_t[edge_index[1]]
+        atten_s = at_s[1].mean(1).unsqueeze(-1)
+        atten_t = at_t[1].mean(1).unsqueeze(-1)
+
+        y = torch.cat((emb_s, emb_t, x_s_d, x_s_c, atten_s, atten_t, edge_weight), axis=1)
+        y = F.normalize(y)
+        for i in range(self.num_layers - 1):
+            y = self.lins[i](y) 
+            y = nn.functional.leaky_relu(y)
+            y = F.dropout(y, p=self.dropout, training=self.training)
+            y = self.norm[i](y)
+
+        y = self.lins[-1](y)
+        y = torch.relu(y).squeeze()
         
-        # read files in specified folder
-        houses = gpd.read_file(os.path.join(self.root, "houses.geojson")).set_index("internal_id")
-        houses = houses[houses["demand"]!=0]
+        y_sum_i = torch.zeros_like(x_s[:, 1], dtype=y.dtype).index_add_(0, edge_index[0], y)[edge_index[0]].unsqueeze(1)
+        y_sum_j = torch.zeros_like(x_t[:, 1], dtype=y.dtype).index_add_(0, edge_index[1], y)[edge_index[1]].unsqueeze(1)
+        coef = torch.cat((y.unsqueeze(1), y_sum_i, x_s_d, y_sum_j, x_s_c), axis=1)
+        coef = F.normalize(coef)
+        coef = self.factors_model(coef).squeeze()
 
-        facilities = gpd.read_file(os.path.join(self.root, "facilities.geojson")).set_index("internal_id")
-        facilities = facilities[facilities["capacity"]!=0]
+        return y * coef
 
-        OD = pd.read_json(os.path.join(self.root, "od_matrix.json"))
-        DM = pd.read_json(os.path.join(self.root, "distance_matrix.json"))
+class FNNStack_v3(nn.Module):
+    def __init__(self, input_dim, hidden_dim_1, hidden_dim_2, output_dim, num_layers, num_layers_norm, dropout):
+        super(FNNStack_v3, self).__init__()
 
-        x = np.array(
-            list(houses.apply(lambda x: [x.name, 1, x.demand], axis=1)) + \
-            list(facilities.apply(lambda x: [x.name, 0, x.capacity], axis=1))
+        self.num_layers = num_layers
+        self.num_layers_norm = num_layers_norm
+        self.dropout = dropout
+
+        self.lins = nn.ModuleList()
+        self.lins.append(nn.Linear(input_dim, hidden_dim_1))
+        for _ in range(self.num_layers - 2):
+            self.lins.append(nn.Linear(hidden_dim_1, hidden_dim_1))
+        self.lins.append(nn.Linear(hidden_dim_1, output_dim))
+
+        self.norm = nn.ModuleList()
+        for l in range(self.num_layers):
+            self.norm.append(nn.LayerNorm(hidden_dim_1))
+
+        self.factors_model = nn.Sequential(
+          nn.Linear(5, hidden_dim_2),
+          nn.ReLU(),
+          nn.Dropout(p=self.dropout),
+          nn.LayerNorm(hidden_dim_2),
+          nn.Linear(hidden_dim_2, 1),
+          nn.ReLU()
+        )
+
+    def forward(self, emb_s, emb_t, at_s, at_t, data):
+
+        x_s, x_t, edge_index, edge_weight = data.x_s, data.x_t, data.edge_index, data.edge_attr.unsqueeze(-1)
+
+        x_s_d = x_s[:, 1][edge_index[0]].unsqueeze(1)
+        x_s_c = x_t[:, 1][edge_index[1]].unsqueeze(1)
+        emb_s = emb_s[edge_index[0]]
+        emb_t = emb_t[edge_index[1]]
+        atten_s = at_s[1].mean(1).unsqueeze(-1)
+        atten_t = at_t[1].mean(1).unsqueeze(-1)
+
+        y = torch.cat((emb_s, emb_t, x_s_d, x_s_c, atten_s, atten_t, edge_weight), axis=1)
+        y = F.normalize(y)
+        for i in range(self.num_layers - 1):
+            y = self.lins[i](y) 
+            y = nn.functional.leaky_relu(y)
+            y = F.dropout(y, p=self.dropout, training=self.training)
+            y = self.norm[i](y)
+
+        y = self.lins[-1](y)
+        y = torch.relu(y).squeeze()
+
+        for i in range(self.num_layers_norm):
+
+            y_sum_i = torch.zeros_like(x_s[:, 1], dtype=y.dtype).index_add_(0, edge_index[0], y)[edge_index[0]].unsqueeze(1)
+            y_sum_j = torch.zeros_like(x_t[:, 1], dtype=y.dtype).index_add_(0, edge_index[1], y)[edge_index[1]].unsqueeze(1)
+            coef = torch.cat((y.unsqueeze(1), y_sum_i, x_s_d, y_sum_j, x_s_c), axis=1)
+            coef = F.normalize(coef)
+            coef = self.factors_model(coef).squeeze()
+            y = y * coef 
+
+        return y * coef
+
+def train_func(gnn_model, fnn_model, train_loader, valid_loader, epochs, writer=None, output=False):
+
+    params = list(fnn_model.parameters()) + list(gnn_model.parameters())
+    optimize = optim.Adam(params,  lr=0.01)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimize, factor=0.9, min_lr=0.001)
+
+    # train
+    for epoch in range(epochs + 1):
+        train_loss = []
+        train_r2 = []
+        for train_data in train_loader:
+            optimize.zero_grad()
+            fnn_model.train()
+            gnn_model.train()
+
+            emb_s, at_s, emb_t, at_t = gnn_model(train_data)
+            predict_y = fnn_model(emb_s, emb_t, at_s, at_t, train_data)
+
+            loss = F.mse_loss(predict_y, train_data.y)
+            r2 = r2_loss(predict_y, train_data.y)
+            train_loss.append(loss)
+            train_r2.append(r2)
+
+            loss.backward()
+            optimize.step()
+
+        t_metrics = {"train_loss": sum(train_loss)/len(train_loss), "train_r2": sum(train_r2)/len(train_r2)}
+        v_metrics = val_func(valid_loader, gnn_model, fnn_model)
+        scheduler.step(v_metrics["valid_loss"])      
+
+        if epoch % 10 == 0:
+
+            if output: print(
+                "Epoch {}. TRAIN: loss {:.4f}, r2: {:.4f}. ".format(epoch, t_metrics["train_loss"], t_metrics["train_r2"]) + \
+                "VALIDATION loss: {:.4f}, r2: {:.4f}. ".format(v_metrics["valid_loss"],  v_metrics["valid_r2"]) + \
+                "Lr: {:.5f}".format(optimize.param_groups[0]["lr"]), 
             )
-        edges = np.array(OD.apply(lambda u: [
-            [u.name, v, f, d] for v, f, d in zip(OD[u != 0].index, u[u != 0], DM[u.name][u != 0].round())
-            ]).explode().dropna().to_list())
+            if writer: 
+                for name, v_metric in v_metrics.items(): writer.add_scalar(name, v_metric, epoch)
+                for name, v_metric in t_metrics.items(): writer.add_scalar(name, v_metric, epoch)
+            # save_ckp(epoch, fnn_model, optimize, datetime_now + f"_epoch_{epoch}", f_path=path)
+
+    return [gnn_model, fnn_model]
+
+
+def val_func(valid_loader, gnn_model, fnn_model):
+
+    valid_loss = []
+    valid_r2 = []
+    for valid_data in valid_loader:
+        with torch.no_grad():
+            fnn_model.eval()
+            gnn_model.eval()
+
+            emb_s, at_s, emb_t, at_t = gnn_model(valid_data)
+            predict_y = fnn_model(emb_s, emb_t, at_s, at_t, valid_data)
             
-        houses_id = x[:, 0][x[:, 1] == 1]
-        services_id = x[:, 0][x[:, 1] == 0]
+            valid_loss.append(F.mse_loss(predict_y, valid_data.y))
+            valid_r2.append(r2_loss(predict_y, valid_data.y))
 
-        # distance distribution in positive edges
-        freq, bins = np.histogram(edges[:, -1], bins=100)
-        freq = freq / freq.sum() 
-
-        # undersampling, number of null edges is equal to len(edges) * f
-        null_edges = []
-        for h_id in houses_id:
-            connected_services = edges[:, 1][edges[:, 0] == h_id]
-            remain_services = [s for s in services_id if s not in connected_services]
-            remain_services_dist = DM[h_id][remain_services]
-            
-            prob = []
-            for dist in list(remain_services_dist): 
-                for n in range(len(bins)):
-                    if dist <= bins[n] or n == (len(bins) - 1):
-                        prob.append(freq[n-1])
-                        break
-
-            s_ids = np.random.choice(
-                a=remain_services, size=len(connected_services) * f, p=prob/sum(prob), replace=False
-                )
-            
-            distances = list(DM[h_id][s_ids])
-            null_edges.extend([[h_id, s_id, 0., d] for s_id, d in zip(s_ids, distances)])
-
-        edges = np.concatenate((edges, np.array(null_edges)))
-
-        # create bipartite graph
-        x_s_id, x_t_id = [], []
-        x_s, x_t = [], []
-
-        for n, t, v in x:
-            if t == 1:
-                x_s_id.append(n)
-                x_s.append([t, v])
-            else:
-                x_t_id.append(n)
-                x_t.append([t, v])
-
-        y = torch.tensor(edges[:, 2], dtype=torch.float32)
-        edge_attr = torch.tensor(edges[:, -1], dtype=torch.float32)
-        edge_index = torch.tensor([[
-            (np.array(x_s_id) == u).nonzero()[0][0], 
-            (np.array(x_t_id) == v).nonzero()[0][0]
-            ] for u, v in edges[:, :2]], dtype=torch.long).T
-        x_s, x_t = torch.tensor(x_s, dtype=torch.float32), torch.tensor(x_t, dtype=torch.float32)
-
-        # create bipartite torch object          
-        graph = BipartiteData(x_s=x_s, x_t=x_t, edge_index=edge_index, y=y, edge_attr=edge_attr)
-        graph.x_s_id = torch.tensor(x_s_id, dtype=torch.long)
-        graph.x_t_id = torch.tensor(x_t_id, dtype=torch.long)
-        
-        data_list = []
-        data_list.append(graph)
-        data, slices = self.collate(data_list)
-        torch.save((data, slices), self.processed_paths[0])
-
-
-class ProvisionSparseDataset_v2(InMemoryDataset):
-    def __init__(self, root, transform=None):
-        super(ProvisionSparseDataset_v2, self).__init__(root, transform)
-        self.data, self.slices = torch.load(self.processed_paths[0])
-
-    @property
-    def raw_file_names(self):
-        files = []
-        for file in os.listdir(self.root):
-            if file.endswith(".graphml"):
-                files.append(file)
-        return files
-        
-    @property
-    def processed_file_names(self):
-        return ['provision.dataset']
-
-    def download(self):
-        pass
-    
-    def process(self):
-        
-        data_list = []
-        graph = nx.read_graphml(os.path.join(self.root, self.raw_file_names[0]), node_type=int)
-        graph_components = [graph.subgraph(c).copy().to_directed() for c in nx.connected_components(graph.to_undirected())]
-        for i, component in tqdm(enumerate(graph_components), total=len(graph_components)):
-            
-            x = gpd.GeoDataFrame.from_dict(dict(component.nodes(data=True)), orient='index')
-            x = x.reset_index()[["index", "type", "value"]].to_numpy()
-            edges = nx.to_pandas_edgelist(component).to_numpy()
-
-            # create bipartite graph
-            x_s_id, x_t_id = [], []
-            x_s, x_t = [], []
-
-            for n, t, v in x:
-                if t == 1:
-                    x_s_id.append(n)
-                    x_s.append([t, v])
-                else:
-                    x_t_id.append(n)
-                    x_t.append([t, v])
-
-            y = torch.tensor(edges[:, 2], dtype=torch.float32)
-            edge_attr = torch.tensor(edges[:, -1], dtype=torch.float32)
-            edge_index = torch.tensor([[
-                (np.array(x_s_id) == u).nonzero()[0][0], 
-                (np.array(x_t_id) == v).nonzero()[0][0]
-                ] for u, v in edges[:, :2]], dtype=torch.long).T
-            x_s, x_t = torch.tensor(x_s, dtype=torch.float32), torch.tensor(x_t, dtype=torch.float32)
-
-            # create bipartite torch object          
-            part_graph = BipartiteData(x_s=x_s, x_t=x_t, edge_index=edge_index, y=y, edge_attr=edge_attr)
-            part_graph.x_s_id = torch.tensor(x_s_id, dtype=torch.long)
-            part_graph.x_t_id = torch.tensor(x_t_id, dtype=torch.long)
-            part_graph.component = torch.tensor([i])
-            
-            data_list.append(part_graph)
-            data, slices = self.collate(data_list)
-            torch.save((data, slices), self.processed_paths[0])
+    return {"valid_loss": np.mean(valid_loss), "valid_r2": np.mean(valid_r2)}

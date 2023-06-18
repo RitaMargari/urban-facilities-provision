@@ -176,8 +176,8 @@ class ProvisionSparseDataset_v2(InMemoryDataset):
                     x_t_id.append(n)
                     x_t.append([t, v])
 
-            y = torch.tensor(edges[:, 2], dtype=torch.float32)
-            edge_attr = torch.tensor(edges[:, -1], dtype=torch.float32)
+            y = torch.tensor(edges[:, -1], dtype=torch.float32)
+            edge_attr = torch.tensor(edges[:, 2], dtype=torch.float32)
             edge_index = torch.tensor([[
                 (np.array(x_s_id) == u).nonzero()[0][0], 
                 (np.array(x_t_id) == v).nonzero()[0][0]
