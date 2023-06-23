@@ -29,7 +29,7 @@ def save_ckp(epoch, model, optimizer, datetime_now, f_path):
     torch.save(checkpoint, f_path)
 
 
-def cross_validation(dataset, num_folds, model_type, model, model_param, train_func, val_func, epochs, output=False, logs=False):
+def cross_validation(dataset, num_folds, model_type, model, model_param, train_func, val_func, epochs=None, output=False, logs=False):
 
     total_size = len(dataset)
     fold_size = int(total_size / num_folds)
@@ -45,19 +45,21 @@ def cross_validation(dataset, num_folds, model_type, model, model_param, train_f
             train_func, val_func, epochs, writer, output
             )
         
-        if out_sample_metrics["valid_r2"] < 0:
-            print(f"Bad initialized weights. The training in {i} fold is repeating...")
+        j = 1
+        while out_sample_metrics["valid_r2"] < 0:
+            print(f"Bad initialized weights. The training in {i} fold is repeating. Attempt {j}...")
             in_sample_metrics, out_sample_metrics = validation_step(
                 i, fold_size, total_size, dataset, model_type, model, model_param, 
                 train_func, val_func, epochs, writer, output
                 )
+            if j == 5: break
+            j += 1
+
 
         metrics["in-sample loss"].append(round(float(in_sample_metrics["valid_loss"]), 4))
         metrics["in-sample R2"].append(round(float(in_sample_metrics["valid_r2"]), 4))
         metrics["out-of-sample loss"].append(round(float(out_sample_metrics["valid_loss"]), 4))
         metrics["out-of-sample R2"].append(round(float(out_sample_metrics["valid_r2"]), 4))
-
-        break
 
     return metrics
 
@@ -83,7 +85,7 @@ def validation_step(i, fold_size, total_size, dataset, model_type, model, model_
         val_loader = DataLoader(val_set, batch_size=len(val_set))
 
         if model_type == "fnn":
-            fnn_model = model[0](**model_param)
+            fnn_model = model[0](**model_param[0])
             trained_model = train_func(fnn_model, train_loader, val_loader, epochs, writer, output)
             in_sample_metrics = val_func(train_loader, trained_model)
             out_sample_metrics = val_func(val_loader, trained_model)
@@ -95,6 +97,11 @@ def validation_step(i, fold_size, total_size, dataset, model_type, model, model_
             in_sample_metrics = val_func(train_loader, gnn_trained_model, fnn_trained_model)
             out_sample_metrics = val_func(val_loader, gnn_trained_model, fnn_trained_model)
         
+        elif model_type == "linear":
+            linear = model[0]
+            linear_model = train_func(linear, train_loader)
+            in_sample_metrics = val_func(linear_model, train_loader)
+            out_sample_metrics = val_func(linear_model, val_loader)
         else:
             raise ValueError("Wrong model type")
         

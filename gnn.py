@@ -45,6 +45,46 @@ class GNNStack(nn.Module):
         return x_s, at_s, x_t, at_t
 
 
+class FNNStack_v0(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers, dropout):
+        super(FNNStack_v0, self).__init__()
+
+        self.num_layers = num_layers
+        self.dropout = dropout
+
+        self.lins = nn.ModuleList()
+        self.lins.append(nn.Linear(input_dim, hidden_dim))
+        for _ in range(self.num_layers - 2):
+            self.lins.append(nn.Linear(hidden_dim, hidden_dim))
+        self.lins.append(nn.Linear(hidden_dim, output_dim))
+
+        self.norm = nn.ModuleList()
+        for l in range(self.num_layers):
+            self.norm.append(nn.LayerNorm(hidden_dim))
+
+    def forward(self, emb_s, emb_t, at_s, at_t, data):
+
+        x_s, x_t, edge_index, edge_weight = data.x_s, data.x_t, data.edge_index, data.edge_attr.unsqueeze(-1)
+
+        x_s_d = x_s[:, 1][edge_index[0]].unsqueeze(1)
+        x_s_c = x_t[:, 1][edge_index[1]].unsqueeze(1)
+        emb_s = emb_s[edge_index[0]]
+        emb_t = emb_t[edge_index[1]]
+        atten_s = at_s[1].mean(1).unsqueeze(-1)
+        atten_t = at_t[1].mean(1).unsqueeze(-1)
+
+        y = torch.cat((emb_s, emb_t, x_s_d, x_s_c, atten_s, atten_t, edge_weight), axis=1)
+        for i in range(self.num_layers - 1):
+            y = self.lins[i](y) 
+            y = nn.functional.leaky_relu(y)
+            y = F.dropout(y, p=self.dropout, training=self.training)
+            y = self.norm[i](y)
+
+        y = self.lins[-1](y)
+        y = torch.relu(y).squeeze()
+        return y
+
+
 class FNNStack_v1(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, num_layers, dropout):
         super(FNNStack_v1, self).__init__()
