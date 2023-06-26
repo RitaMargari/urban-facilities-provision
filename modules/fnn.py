@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import torch.nn as nn
 import numpy as np
 
-from metrics import r2_loss, weighted_mse_loss
+from modules.metrics import r2_loss, weighted_mse_loss
 
 # torch.manual_seed(0)
 
@@ -191,15 +191,18 @@ def train_func(fnn_model, train_loader, valid_loader, epochs, writer=None, outpu
     return fnn_model
 
 
-def val_func(valid_loader, fnn_model):
+def val_func(valid_loader, fnn_model, return_y=False):
 
     valid_loss = []
     valid_r2 = []
-    for valid_data in valid_loader:
-        with torch.no_grad():
-            fnn_model.eval()
-            predict_y = fnn_model(valid_data)
-            valid_loss.append(F.mse_loss(predict_y, valid_data.y))
-            valid_r2.append(r2_loss(predict_y, valid_data.y))
+    valid_data = next(iter(valid_loader))
+    with torch.no_grad():
+        fnn_model.eval()
+        predict_y = fnn_model(valid_data)
+        valid_loss.append(F.mse_loss(predict_y, valid_data.y))
+        valid_r2.append(r2_loss(predict_y, valid_data.y))
 
-    return {"valid_loss": np.mean(valid_loss), "valid_r2": np.mean(valid_r2)}
+    if return_y:
+        return predict_y
+    else:
+        return {"valid_loss": np.mean(valid_loss), "valid_r2": np.mean(valid_r2)}

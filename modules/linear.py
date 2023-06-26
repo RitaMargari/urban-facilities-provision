@@ -17,7 +17,7 @@ def train_func(linear, train_data):
 
     return linear
 
-def val_func(linear, test_data):
+def val_func(linear, test_data, return_y=False):
 
     data = next(iter(test_data))
     y_test = data.y
@@ -30,4 +30,7 @@ def val_func(linear, test_data):
     y_pred = linear.predict(X_test)
     y_pred = np.where(y_pred > 0, y_pred, 0)
 
-    return {"valid_loss": mean_squared_error(y_test, y_pred), "valid_r2": r2_score(y_test, y_pred)} 
+    if return_y:
+        return y_pred
+    else:
+        return {"valid_loss": mean_squared_error(y_test, y_pred), "valid_r2": r2_score(y_test, y_pred)} 

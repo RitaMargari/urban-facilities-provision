@@ -7,7 +7,7 @@ import torch.optim as optim
 import torch.nn as nn
 import torch
 
-from metrics import r2_loss, weighted_mse_loss
+from modules.metrics import r2_loss, weighted_mse_loss
 
 class GNNStack(nn.Module):
     def __init__(self, input_dim, hidden_dim, dropout, heads=3, aggr=None):
@@ -137,74 +137,8 @@ class FNNStack_v1(nn.Module):
 
 
 class FNNStack_v2(nn.Module):
-    def __init__(self, input_dim, hidden_dim_1, hidden_dim_2, output_dim, num_layers, dropout):
-        super(FNNStack_v2, self).__init__()
-
-        self.num_layers = num_layers
-        self.dropout = dropout
-
-        self.lins = nn.ModuleList()
-        self.lins.append(nn.Linear(input_dim, hidden_dim_1))
-        for _ in range(self.num_layers - 2):
-            self.lins.append(nn.Linear(hidden_dim_1, hidden_dim_1))
-        self.lins.append(nn.Linear(hidden_dim_1, output_dim))
-
-        self.norm = nn.ModuleList()
-        for l in range(self.num_layers):
-            self.norm.append(nn.LayerNorm(hidden_dim_1))
-
-        self.factors_model = nn.Sequential(
-          nn.Linear(5, hidden_dim_2),
-          nn.ReLU(),
-          nn.Dropout(p=self.dropout),
-          nn.LayerNorm(hidden_dim_2),
-          nn.Linear(hidden_dim_2, 1),
-          nn.ReLU()
-        )
-
-    def normalize_y(self, x_s, x_t, edge_index, y):
-
-        y_sum_i = torch.zeros_like(x_s[:, 1], dtype=y.dtype).index_add_(0, edge_index[0], y)
-        y_norm_i = y * x_s[:, 1][edge_index[0, :]] / (y_sum_i[edge_index[0]] + 3.4028e-38)
-        y_sum_j = torch.zeros_like(x_t[:, 1], dtype=y.dtype).index_add_(0, edge_index[1], y)
-        y_norm_j = y * x_t[:, 1][edge_index[1, :]] / (y_sum_j[edge_index[1]] + 3.4028e-38)
-
-        y_new = torch.min(y_norm_i, y_norm_j)
-        return y_new
-    
-    def forward(self, emb_s, emb_t, at_s, at_t, data):
-
-        x_s, x_t, edge_index, edge_weight = data.x_s, data.x_t, data.edge_index, data.edge_attr.unsqueeze(-1)
-
-        x_s_d = x_s[:, 1][edge_index[0]].unsqueeze(1)
-        x_s_c = x_t[:, 1][edge_index[1]].unsqueeze(1)
-        emb_s = emb_s[edge_index[0]]
-        emb_t = emb_t[edge_index[1]]
-        atten_s = at_s[1].mean(1).unsqueeze(-1)
-        atten_t = at_t[1].mean(1).unsqueeze(-1)
-
-        y = torch.cat((emb_s, emb_t, x_s_d, x_s_c, atten_s, atten_t, edge_weight), axis=1)
-        y = F.normalize(y)
-        for i in range(self.num_layers - 1):
-            y = self.lins[i](y) 
-            y = nn.functional.leaky_relu(y)
-            y = F.dropout(y, p=self.dropout, training=self.training)
-            y = self.norm[i](y)
-
-        y = self.lins[-1](y)
-        y = torch.relu(y).squeeze()
-        
-        y_sum_i = torch.zeros_like(x_s[:, 1], dtype=y.dtype).index_add_(0, edge_index[0], y)[edge_index[0]].unsqueeze(1)
-        y_sum_j = torch.zeros_like(x_t[:, 1], dtype=y.dtype).index_add_(0, edge_index[1], y)[edge_index[1]].unsqueeze(1)
-        coef = torch.cat((y.unsqueeze(1), y_sum_i, x_s_d, y_sum_j, x_s_c), axis=1)
-        coef = F.normalize(coef)
-        coef = self.factors_model(coef).squeeze()
-
-        return y * coef
-
-class FNNStack_v3(nn.Module):
     def __init__(self, input_dim, hidden_dim_1, hidden_dim_2, output_dim, num_layers, num_layers_norm, dropout):
-        super(FNNStack_v3, self).__init__()
+        super(FNNStack_v2, self).__init__()
 
         self.num_layers = num_layers
         self.num_layers_norm = num_layers_norm
@@ -307,19 +241,22 @@ def train_func(gnn_model, fnn_model, train_loader, valid_loader, epochs, writer=
     return [gnn_model, fnn_model]
 
 
-def val_func(valid_loader, gnn_model, fnn_model):
+def val_func(valid_loader, gnn_model, fnn_model, return_y=False):
 
     valid_loss = []
     valid_r2 = []
-    for valid_data in valid_loader:
-        with torch.no_grad():
-            fnn_model.eval()
-            gnn_model.eval()
+    valid_data = next(iter(valid_loader))
+    with torch.no_grad():
+        fnn_model.eval()
+        gnn_model.eval()
 
-            emb_s, at_s, emb_t, at_t = gnn_model(valid_data)
-            predict_y = fnn_model(emb_s, emb_t, at_s, at_t, valid_data)
-            
-            valid_loss.append(F.mse_loss(predict_y, valid_data.y))
-            valid_r2.append(r2_loss(predict_y, valid_data.y))
+        emb_s, at_s, emb_t, at_t = gnn_model(valid_data)
+        predict_y = fnn_model(emb_s, emb_t, at_s, at_t, valid_data)
+        
+        valid_loss.append(F.mse_loss(predict_y, valid_data.y))
+        valid_r2.append(r2_loss(predict_y, valid_data.y))
 
-    return {"valid_loss": np.mean(valid_loss), "valid_r2": np.mean(valid_r2)}
+    if return_y:
+        return predict_y
+    else:
+        return {"valid_loss": np.mean(valid_loss), "valid_r2": np.mean(valid_r2)}
