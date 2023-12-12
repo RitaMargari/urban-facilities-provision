@@ -81,11 +81,11 @@ def load_graph_geometry(G_nx, node=True, edge=False):
 
 """Functions to calculate distance matrix with road network"""
 
-def calculate_distance_matrix(road_network, houses, facilities, crs=32636):
+def calculate_distance_matrix(road_network, houses, facilities, crs=32636, type=['walk'], weight='length_meter'):
 
     network = road_network.edge_subgraph(
     [(u, v, k) for u, v, k, d in road_network.edges(data=True, keys=True) 
-    if d["type"] == "walk"]
+    if d["type"] in type]
     )
 
     # find nearest points to objects on road network
@@ -100,7 +100,7 @@ def calculate_distance_matrix(road_network, houses, facilities, crs=32636):
     
     # conver nx graph to nk graph in oder to speed up the calculation
     nk_idmap = get_nx2nk_idmap(network)
-    net_nk =  convert_nx2nk(network, idmap=nk_idmap, weight="length_meter")
+    net_nk =  convert_nx2nk(network, idmap=nk_idmap, weight=weight)
 
     # calculate distance matrix
     for i in range(len(splited_matrix)):

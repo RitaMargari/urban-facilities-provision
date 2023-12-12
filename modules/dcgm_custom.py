@@ -61,7 +61,7 @@ def dfs_to_arrays(houses, facilities, distance_matrix):
 
 
 def custom_dcgm_loop(edge_index, edge_attr, x, selection_range, p):
-
+    
     step = selection_range
     max_distant = np.max(edge_attr)
 
@@ -80,7 +80,6 @@ def custom_dcgm_loop(edge_index, edge_attr, x, selection_range, p):
         # on each step we select edges for which the following statements are True:
         # 1. edges distance is less than iter_distances[n],
         # 2. source and target have resources (capacity and demand),
-        # 3. population  flow wasn't predicted on the previous step.
         
         select = (edge_attr <= iter_distances[n]) &\
                  (((x[:, 1][edge_index[0]] != 0) & (x[:, 1][edge_index[1]] != 0)))
@@ -103,6 +102,7 @@ def custom_dcgm_loop(edge_index, edge_attr, x, selection_range, p):
         np.add.at(flows, id_edges_step, flows_step)
         
     pbar.close()
+
     return flows
 
 
