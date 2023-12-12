@@ -163,8 +163,7 @@ def train_func(fnn_model, train_loader, valid_loader, epochs, writer=None, outpu
             fnn_model.train()
             predict_y = fnn_model(train_data)
 
-            loss_weight = torch.log(math.e + train_data.edge_attr)
-            loss = weighted_mse_loss(predict_y, train_data.y, loss_weight)
+            loss = F.mse_loss(predict_y, train_data.y)
             r2 = r2_loss(predict_y, train_data.y)
             train_loss.append(loss)
             train_r2.append(r2)
