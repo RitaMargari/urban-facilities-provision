@@ -1,6 +1,7 @@
 import torch_geometric.nn as pyg_nn
 import numpy as np
 import math
+import copy
 
 import torch.nn.functional as F
 import torch.optim as optim
@@ -219,6 +220,10 @@ def train_func(gnn_model, fnn_model, train_loader, valid_loader, epochs, writer=
     optimize = optim.Adam(params,  lr=0.01)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimize, factor=0.9, min_lr=0.001)
 
+    best_loss = float('inf')
+    best_gnn_model_state = None
+    best_fnn_model_state = None
+
     # train
     for epoch in range(epochs + 1):
         train_loss = []
@@ -243,6 +248,11 @@ def train_func(gnn_model, fnn_model, train_loader, valid_loader, epochs, writer=
         v_metrics = val_func(valid_loader, gnn_model, fnn_model)
         scheduler.step(v_metrics["valid_loss"])      
 
+        if v_metrics["valid_loss"] < best_loss:
+            best_loss = v_metrics["valid_loss"]
+            best_gnn_model_state = copy.deepcopy(gnn_model.state_dict())
+            best_fnn_model_state = copy.deepcopy(fnn_model.state_dict())
+
         if epoch % 10 == 0:
 
             if output: print(
@@ -255,6 +265,8 @@ def train_func(gnn_model, fnn_model, train_loader, valid_loader, epochs, writer=
                 for name, v_metric in t_metrics.items(): writer.add_scalar(name, v_metric, epoch)
             # save_ckp(epoch, fnn_model, optimize, datetime_now + f"_epoch_{epoch}", f_path=path)
 
+    gnn_model.load_state_dict(best_gnn_model_state if best_gnn_model_state is not None else gnn_model.state_dict())
+    fnn_model.load_state_dict(best_fnn_model_state if best_fnn_model_state is not None else fnn_model.state_dict())
     return [gnn_model, fnn_model]
 
 

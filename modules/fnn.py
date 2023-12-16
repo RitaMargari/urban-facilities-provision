@@ -4,6 +4,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 import torch.nn as nn
 import numpy as np
+import copy
 
 from modules.metrics import r2_loss, weighted_mse_loss
 
@@ -151,7 +152,10 @@ class FNN_v2(nn.Module):
 def train_func(fnn_model, train_loader, valid_loader, epochs, writer=None, output=False):
 
     optimize = optim.Adam(list(fnn_model.parameters()),  lr=0.001)
-    # scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimize, factor=0.9, min_lr=0.0001)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimize, factor=0.9, min_lr=0.0001)
+
+    best_loss = float('inf')
+    best_model_state = None
 
     # train
     for epoch in range(epochs + 1):
@@ -173,10 +177,14 @@ def train_func(fnn_model, train_loader, valid_loader, epochs, writer=None, outpu
 
         t_metrics = {"train_loss": sum(train_loss)/len(train_loss), "train_r2": sum(train_r2)/len(train_r2)}        
 
-        if epoch % 10 == 0:
-            v_metrics = val_func(valid_loader, fnn_model)
-            # scheduler.step(v_metrics["valid_loss"])
+        v_metrics = val_func(valid_loader, fnn_model)
+        scheduler.step(v_metrics["valid_loss"])
 
+        if v_metrics["valid_loss"] < best_loss:
+            best_loss = v_metrics["valid_loss"]
+            best_model_state = copy.deepcopy(fnn_model.state_dict())
+
+        if epoch % 10 == 0:
             if output: print(
                 "Epoch {}. TRAIN: loss {:.4f}, r2: {:.4f}. ".format(epoch, t_metrics["train_loss"], t_metrics["train_r2"]) + \
                 "VALIDATION loss: {:.4f}, r2: {:.4f}. ".format(v_metrics["valid_loss"],  v_metrics["valid_r2"]) + \
@@ -187,6 +195,7 @@ def train_func(fnn_model, train_loader, valid_loader, epochs, writer=None, outpu
                 for name, v_metric in t_metrics.items(): writer.add_scalar(name, v_metric, epoch)
             # save_ckp(epoch, fnn_model, optimize, datetime_now + f"_epoch_{epoch}", f_path=path)
 
+    fnn_model.load_state_dict(best_model_state)
     return fnn_model
 
 
