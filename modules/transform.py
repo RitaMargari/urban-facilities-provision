@@ -11,6 +11,7 @@ import shapely.wkt
 import networkx as nx
 import networkit as nk
 
+from tqdm import tqdm
 from scipy import spatial
 from shapely.geometry import LineString
 
