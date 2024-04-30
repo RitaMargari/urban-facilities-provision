@@ -1,10 +1,30 @@
 import os
 import torch
+import numpy as np
 
 from tensorboardX import SummaryWriter
 from datetime import datetime
 from torch_geometric.loader.dataloader import DataLoader
 from tqdm.notebook import trange
+
+
+def nb2_loss(actual, log_pred, disp):
+    m = 1 / torch.exp(disp)
+    mu = torch.exp(log_pred)
+    p = 1 / (1 + mu * torch.exp(disp))
+    nll = torch.lgamma(m + actual) - torch.lgamma(actual + 1) - torch.lgamma(m)
+    nll += m * torch.log(p) + actual * torch.log1p(-p)
+    return -nll.mean()
+
+def CPC(y, y_hat):
+
+    if type(y) == torch.Tensor: y = y.detach().cpu().numpy()
+    if type(y_hat) == torch.Tensor: y_hat = y_hat.detach().cpu().numpy()
+
+    nom = 2 * np.min((y, y_hat), axis=0).sum()
+    denom = y.sum() + y_hat.sum()
+
+    return nom / denom
 
 
 def r2_loss(output, target):
@@ -29,14 +49,21 @@ def save_ckp(epoch, model, optimizer, datetime_now, f_path):
     torch.save(checkpoint, f_path)
 
 
-def cross_validation(dataset, num_folds, model_type, model, model_param, train_func, val_func, 
+def cross_validation(dataset, num_folds, model_type, model, model_param, train_func, val_func, device='cpu',
                      epochs=None, output=False, logs=False):
 
     total_size = len(dataset)
     fold_size = int(total_size / num_folds)
 
     datetime_now = datetime.now().strftime("%Y%m%d-%H%M%S")
-    metrics = {"in-sample loss": [], "in-sample R2": [], "out-of-sample loss": [], "out-of-sample R2": []}
+    metrics = {
+        "in-sample loss": [], 
+        "in-sample R2": [], 
+        "in-sample CPC": [],
+        "out-of-sample loss": [], 
+        "out-of-sample R2": [],
+        "out-of-sample CPC": []
+        }
     y_predicted = []
     for i in trange(num_folds):
 
@@ -44,7 +71,7 @@ def cross_validation(dataset, num_folds, model_type, model, model_param, train_f
 
         in_sample_metrics, out_sample_metrics, y_fold = validation_step(
             i, num_folds, fold_size, total_size, dataset, model_type, model, model_param, 
-            train_func, val_func, epochs, writer, output
+            train_func, val_func, device, epochs, writer, output
             )
         
         j = 1
@@ -52,7 +79,7 @@ def cross_validation(dataset, num_folds, model_type, model, model_param, train_f
             print(f"Bad initialized weights. The training in {i} fold is repeating. Attempt {j}...")
             in_sample_metrics, out_sample_metrics, y_fold = validation_step(
                 i, num_folds, fold_size, total_size, dataset, model_type, model, model_param, 
-                train_func, val_func, epochs, writer, output
+                train_func, val_func, device, epochs, writer, output
                 )
             if j == 5: break
             j += 1
@@ -60,8 +87,10 @@ def cross_validation(dataset, num_folds, model_type, model, model_param, train_f
 
         metrics["in-sample loss"].append(round(float(in_sample_metrics["valid_loss"]), 4))
         metrics["in-sample R2"].append(round(float(in_sample_metrics["valid_r2"]), 4))
+        metrics["in-sample CPC"].append(round(float(in_sample_metrics["valid_cpc"]), 4))
         metrics["out-of-sample loss"].append(round(float(out_sample_metrics["valid_loss"]), 4))
         metrics["out-of-sample R2"].append(round(float(out_sample_metrics["valid_r2"]), 4))
+        metrics["out-of-sample CPC"].append(round(float(out_sample_metrics["valid_cpc"]), 4))
 
         y_predicted.append(y_fold)
 
@@ -69,7 +98,7 @@ def cross_validation(dataset, num_folds, model_type, model, model_param, train_f
 
     
 def validation_step(i, num_folds, fold_size, total_size, dataset, model_type, model, model_param, 
-                    train_func, val_func, epochs, writer, output):
+                    train_func, val_func, device, epochs, writer, output):
             
         trll = 0
         trlr = i * fold_size
@@ -89,21 +118,23 @@ def validation_step(i, num_folds, fold_size, total_size, dataset, model_type, mo
         val_loader = DataLoader(val_set, batch_size=len(val_set))
 
         if model_type == "fnn":
-            fnn_model = model[0](**model_param[0])
-            trained_model = train_func(fnn_model, train_loader, val_loader, epochs, writer, output)
-            in_sample_metrics = val_func(train_loader, trained_model)
-            out_sample_metrics = val_func(val_loader, trained_model)
+            fnn_model = model[0](**model_param[0]).to(device)
+            trained_model = train_func(fnn_model, train_loader, val_loader, epochs, writer, output, device)
+            in_sample_metrics = val_func(train_loader, trained_model, device=device)
+            out_sample_metrics = val_func(val_loader, trained_model, device=device)
 
-            y_predict = val_func(val_loader, trained_model, return_y=True)
+            y_predict = val_func(val_loader, trained_model, device=device, return_y=True)
 
         elif model_type == "gnn+fnn":
-            gnn_model = model[0](**model_param[0])
-            fnn_model = model[1](**model_param[1])
-            gnn_trained_model, fnn_trained_model = train_func(gnn_model, fnn_model, train_loader, val_loader, epochs, writer, output)
-            in_sample_metrics = val_func(train_loader, gnn_trained_model, fnn_trained_model)
-            out_sample_metrics = val_func(val_loader, gnn_trained_model, fnn_trained_model)
+            gnn_model = model[0](**model_param[0]).to(device)
+            fnn_model = model[1](**model_param[1]).to(device)
+            gnn_trained_model, fnn_trained_model = train_func(
+                gnn_model, fnn_model, train_loader, val_loader, epochs, writer, output, device=device
+                )
+            in_sample_metrics = val_func(train_loader, gnn_trained_model, fnn_trained_model, device=device)
+            out_sample_metrics = val_func(val_loader, gnn_trained_model, fnn_trained_model, device=device)
 
-            y_predict = val_func(val_loader, gnn_trained_model, fnn_trained_model, return_y=True)
+            y_predict = val_func(val_loader, gnn_trained_model, fnn_trained_model, device=device, return_y=True)
         
         elif model_type == "linear":
             linear = model[0]

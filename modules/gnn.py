@@ -8,7 +8,7 @@ import torch.optim as optim
 import torch.nn as nn
 import torch
 
-from modules.metrics import r2_loss, weighted_mse_loss
+from modules.metrics import r2_loss, weighted_mse_loss, CPC
 
 class GNNStack(nn.Module):
     def __init__(self, input_dim, hidden_dim, dropout, heads=5, aggr=None):
@@ -24,14 +24,15 @@ class GNNStack(nn.Module):
             pyg_nn.GATConv((hidden_dim * heads, hidden_dim * heads), hidden_dim, **self.kwargs, concat=False)
             ])
 
-    def forward(self, data):
-        x_s, x_t, edge_index, edge_weight = data.x_s, data.x_t, data.edge_index, data.edge_attr.unsqueeze(-1)
+    def forward(self, x_s, x_t, edge_index, edge_weight):
+
         edge_index_reverse = torch.concat((edge_index[1].unsqueeze(1), edge_index[0].unsqueeze(1)), 1).T
     
         for i in range(self.num_layers):
 
             kwargs_st = {"size": (x_s.size(0), x_t.size(0)), "return_attention_weights": True}
             kwargs_ts = {"size": (x_t.size(0), x_s.size(0)), "return_attention_weights": True}
+    
             x_new_t, at_t = self.convs[i]((x_s, x_t), edge_index, edge_weight, **kwargs_st)
             x_new_s, at_s = self.convs[i]((x_t, x_s), edge_index_reverse, edge_weight, **kwargs_ts)
 
@@ -63,9 +64,7 @@ class FNNStack_v1(nn.Module):
         for l in range(self.num_layers):
             self.norm.append(nn.LayerNorm(hidden_dim))
 
-    def forward(self, emb_s, emb_t, at_s, at_t, data):
-
-        x_s, x_t, edge_index, edge_weight = data.x_s, data.x_t, data.edge_index, data.edge_attr.unsqueeze(-1)
+    def forward(self, emb_s, emb_t, at_s, at_t, x_s, x_t, edge_index, edge_weight):
 
         x_s_d = x_s[:, 1][edge_index[0]].unsqueeze(1)
         x_s_c = x_t[:, 1][edge_index[1]].unsqueeze(1)
@@ -113,9 +112,7 @@ class FNNStack_v2(nn.Module):
           nn.ReLU()
         )
 
-    def forward(self, emb_s, emb_t, at_s, at_t, data):
-
-        x_s, x_t, edge_index, edge_weight = data.x_s, data.x_t, data.edge_index, data.edge_attr.unsqueeze(-1)
+    def forward(self, emb_s, emb_t, at_s, at_t, x_s, x_t, edge_index, edge_weight):
 
         x_s_d = x_s[:, 1][edge_index[0]].unsqueeze(1)
         x_s_c = x_t[:, 1][edge_index[1]].unsqueeze(1)
@@ -174,9 +171,7 @@ class FNNStack_v3(nn.Module):
           nn.ReLU()
         )
 
-    def forward(self, emb_s, emb_t, at_s, at_t, data):
-
-        x_s, x_t, edge_index, edge_weight = data.x_s, data.x_t, data.edge_index, data.edge_attr.unsqueeze(-1)
+    def forward(self, emb_s, emb_t, at_s, at_t, x_s, x_t, edge_index, edge_weight):
 
         x_s_d = x_s[:, 1][edge_index[0]].unsqueeze(1)
         x_s_c = x_t[:, 1][edge_index[1]].unsqueeze(1)
@@ -214,7 +209,8 @@ class FNNStack_v3(nn.Module):
 
         return y 
 
-def train_func(gnn_model, fnn_model, train_loader, valid_loader, epochs, writer=None, output=False):
+
+def train_func(gnn_model, fnn_model, train_loader, valid_loader, epochs, writer=None, output=False, device='cpu'):
 
     params = list(fnn_model.parameters()) + list(gnn_model.parameters())
     optimize = optim.Adam(params,  lr=0.01)
@@ -228,25 +224,49 @@ def train_func(gnn_model, fnn_model, train_loader, valid_loader, epochs, writer=
     for epoch in range(epochs + 1):
         train_loss = []
         train_r2 = []
+        train_cpc = []
+
         for train_data in train_loader:
+
             optimize.zero_grad()
             fnn_model.train()
             gnn_model.train()
 
-            emb_s, at_s, emb_t, at_t = gnn_model(train_data)
-            predict_y = fnn_model(emb_s, emb_t, at_s, at_t, train_data)
+            y = train_data.y.to(device)
+            x_s = train_data.x_s.to(device)
+            x_t = train_data.x_t.to(device)
+            edge_index = train_data.edge_index.to(device)
+            edge_weight = train_data.edge_attr.unsqueeze(-1).to(device)
 
-            loss = F.mse_loss(predict_y, train_data.y)
-            r2 = r2_loss(predict_y, train_data.y)
+            mask = (x_s[edge_index[0], 1] != 0) & (x_t[edge_index[1], 1] != 0)
+            y = y[mask]
+            edge_index = edge_index[:, mask]
+            edge_weight = edge_weight[mask]
+
+            emb_s, at_s, emb_t, at_t = gnn_model(x_s, x_t, edge_index, edge_weight)
+            predict_y = fnn_model(emb_s, emb_t, at_s, at_t, x_s, x_t, edge_index, edge_weight)
+
+            poisson_loss = nn.PoissonNLLLoss(log_input=False)
+            loss = poisson_loss(predict_y, y)
+            # loss = F.mse_loss(predict_y, y)
+            r2 = r2_loss(predict_y, y)
+            cpc = CPC(y, predict_y)
+
             train_loss.append(loss)
             train_r2.append(r2)
+            train_cpc.append(cpc)
 
             loss.backward()
             optimize.step()
 
-        t_metrics = {"train_loss": sum(train_loss)/len(train_loss), "train_r2": sum(train_r2)/len(train_r2)}
-        v_metrics = val_func(valid_loader, gnn_model, fnn_model)
-        scheduler.step(v_metrics["valid_loss"])      
+        t_metrics = {
+            "train_loss": sum(train_loss)/len(train_loss), 
+            "train_r2": sum(train_r2)/len(train_r2),
+            "train_cpc": sum(train_cpc)/len(train_cpc)
+            }        
+
+        v_metrics = val_func(valid_loader, gnn_model, fnn_model, device=device)
+        scheduler.step(v_metrics["valid_loss"])    
 
         if v_metrics["valid_loss"] < best_loss:
             best_loss = v_metrics["valid_loss"]
@@ -254,10 +274,13 @@ def train_func(gnn_model, fnn_model, train_loader, valid_loader, epochs, writer=
             best_fnn_model_state = copy.deepcopy(fnn_model.state_dict())
 
         if epoch % 10 == 0:
-
             if output: print(
-                "Epoch {}. TRAIN: loss {:.4f}, r2: {:.4f}. ".format(epoch, t_metrics["train_loss"], t_metrics["train_r2"]) + \
-                "VALIDATION loss: {:.4f}, r2: {:.4f}. ".format(v_metrics["valid_loss"],  v_metrics["valid_r2"]) + \
+                "Epoch {}. TRAIN: loss {:.4f}, r2: {:.4f}. CPC: {:.4f}.".format(
+                    epoch, t_metrics["train_loss"], t_metrics["train_r2"], t_metrics["train_cpc"]
+                    ) + \
+                "VALIDATION loss: {:.4f}, r2: {:.4f}. CPC: {:.4f}.".format(
+                    v_metrics["valid_loss"],  v_metrics["valid_r2"], v_metrics["valid_cpc"]
+                    ) + \
                 "Lr: {:.5f}".format(optimize.param_groups[0]["lr"]), 
             )
             if writer: 
@@ -270,22 +293,46 @@ def train_func(gnn_model, fnn_model, train_loader, valid_loader, epochs, writer=
     return [gnn_model, fnn_model]
 
 
-def val_func(valid_loader, gnn_model, fnn_model, return_y=False):
+def val_func(valid_loader, gnn_model, fnn_model, return_y=False, device='cpu'):
 
     valid_loss = []
     valid_r2 = []
-    valid_data = next(iter(valid_loader))
+    valid_cpc = []
+    valid_data = next(iter(valid_loader)).to(device)
+
     with torch.no_grad():
+
         fnn_model.eval()
         gnn_model.eval()
 
-        emb_s, at_s, emb_t, at_t = gnn_model(valid_data)
-        predict_y = fnn_model(emb_s, emb_t, at_s, at_t, valid_data)
+        y = valid_data.y.to(device)
+        x_s = valid_data.x_s.to(device)
+        x_t = valid_data.x_t.to(device)
+        edge_index = valid_data.edge_index.to(device)
+        edge_weight = valid_data.edge_attr.unsqueeze(-1).to(device)
+
+        mask = (x_s[edge_index[0], 1] != 0) & (x_t[edge_index[1], 1] != 0)
+        y = y[mask]
+        edge_index = edge_index[:, mask]
+        edge_weight = edge_weight[mask]
+
+        emb_s, at_s, emb_t, at_t = gnn_model(x_s, x_t, edge_index, edge_weight)
+        predict_y = fnn_model(emb_s, emb_t, at_s, at_t, x_s, x_t, edge_index, edge_weight)
         
-        valid_loss.append(F.mse_loss(predict_y, valid_data.y))
-        valid_r2.append(r2_loss(predict_y, valid_data.y))
+        poisson_loss = nn.PoissonNLLLoss(log_input=False)
+        
+        # valid_loss.append(F.mse_loss(predict_y, y))
+        valid_loss.append(poisson_loss(predict_y, y))
+        valid_r2.append(r2_loss(predict_y, y))
+        valid_cpc.append(CPC(y, predict_y))
 
     if return_y:
         return predict_y
     else:
-        return {"valid_loss": np.mean(valid_loss), "valid_r2": np.mean(valid_r2)}
+        valid_loss = [l.cpu() for l in valid_loss]
+        valid_r2 = [r.cpu() for r in valid_r2]
+        return {
+            "valid_loss": np.mean(valid_loss), 
+            "valid_r2": np.mean(valid_r2),
+            "valid_cpc": np.mean(valid_cpc)
+            }

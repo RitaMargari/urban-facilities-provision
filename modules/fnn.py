@@ -6,7 +6,7 @@ import torch.nn as nn
 import numpy as np
 import copy
 
-from modules.metrics import r2_loss, weighted_mse_loss
+from modules.metrics import r2_loss, CPC, weighted_mse_loss, nb2_loss
 
 # torch.manual_seed(0)
 
@@ -28,10 +28,9 @@ class FNN_v0(nn.Module):
             self.norm.append(nn.LayerNorm(hidden_dim))
 
         self.dropout = dropout
+        self.disp = torch.nn.Parameter(torch.tensor(1.))
 
-    def forward(self, data):
-
-        x_s, x_t, edge_index, edge_weight = data.x_s, data.x_t, data.edge_index, data.edge_attr.unsqueeze(-1)
+    def forward(self, x_s, x_t, edge_index, edge_weight):
 
         x_s_d = x_s[:, 1][edge_index[0]].unsqueeze(1)
         x_s_c = x_t[:, 1][edge_index[1]].unsqueeze(1)
@@ -76,9 +75,7 @@ class FNN_v1(nn.Module):
         y_new = torch.min(y_norm_i, y_norm_j)
         return y_new
 
-    def forward(self, data):
-
-        x_s, x_t, edge_index, edge_weight = data.x_s, data.x_t, data.edge_index, data.edge_attr.unsqueeze(-1)
+    def forward(self, x_s, x_t, edge_index, edge_weight):
 
         x_s_d = x_s[:, 1][edge_index[0]].unsqueeze(1)
         x_s_c = x_t[:, 1][edge_index[1]].unsqueeze(1)
@@ -123,9 +120,7 @@ class FNN_v2(nn.Module):
           nn.ReLU()
         )
 
-    def forward(self, data):
-
-        x_s, x_t, edge_index, edge_weight = data.x_s, data.x_t, data.edge_index, data.edge_attr.unsqueeze(-1)
+    def forward(self, x_s, x_t, edge_index, edge_weight):
 
         x_s_d = x_s[:, 1][edge_index[0]].unsqueeze(1)
         x_s_c = x_t[:, 1][edge_index[1]].unsqueeze(1)
@@ -149,10 +144,10 @@ class FNN_v2(nn.Module):
         return y
 
 
-def train_func(fnn_model, train_loader, valid_loader, epochs, writer=None, output=False):
+def train_func(fnn_model, train_loader, valid_loader, epochs, writer=None, output=False, device='cpu'):
 
-    optimize = optim.Adam(list(fnn_model.parameters()),  lr=0.001)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimize, factor=0.9, min_lr=0.0001)
+    optimize = optim.Adam(list(fnn_model.parameters()),  lr=0.01)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimize, factor=0.9, min_lr=0.001)
 
     best_loss = float('inf')
     best_model_state = None
@@ -161,23 +156,41 @@ def train_func(fnn_model, train_loader, valid_loader, epochs, writer=None, outpu
     for epoch in range(epochs + 1):
         train_loss = []
         train_r2 = []
+        train_cpc = []
+
         for train_data in train_loader:
 
             optimize.zero_grad()
             fnn_model.train()
-            predict_y = fnn_model(train_data)
 
-            loss = F.mse_loss(predict_y, train_data.y)
-            r2 = r2_loss(predict_y, train_data.y)
+            y = train_data.y.to(device)
+            x_s = train_data.x_s.to(device)
+            x_t = train_data.x_t.to(device)
+            edge_index = train_data.edge_index.to(device)
+            edge_weight = train_data.edge_attr.unsqueeze(-1).to(device)
+
+            predict_y = fnn_model(x_s, x_t, edge_index, edge_weight)
+
+            poisson_loss = nn.PoissonNLLLoss(log_input=False)
+            loss = poisson_loss(predict_y, y)
+            # loss = nb2_loss(y, torch.log(predict_y + 1e-8), fnn_model.disp)
+            # loss = F.mse_loss(predict_y, y)
+            r2 = r2_loss(predict_y, y)
+            cpc = CPC(y, predict_y)
             train_loss.append(loss)
             train_r2.append(r2)
+            train_cpc.append(cpc)
 
             loss.backward()
             optimize.step()
 
-        t_metrics = {"train_loss": sum(train_loss)/len(train_loss), "train_r2": sum(train_r2)/len(train_r2)}        
+        t_metrics = {
+            "train_loss": sum(train_loss)/len(train_loss), 
+            "train_r2": sum(train_r2)/len(train_r2),
+            "train_cpc": sum(train_cpc)/len(train_cpc)
+            }        
 
-        v_metrics = val_func(valid_loader, fnn_model)
+        v_metrics = val_func(valid_loader, fnn_model, device=device)
         scheduler.step(v_metrics["valid_loss"])
 
         if v_metrics["valid_loss"] < best_loss:
@@ -186,8 +199,12 @@ def train_func(fnn_model, train_loader, valid_loader, epochs, writer=None, outpu
 
         if epoch % 10 == 0:
             if output: print(
-                "Epoch {}. TRAIN: loss {:.4f}, r2: {:.4f}. ".format(epoch, t_metrics["train_loss"], t_metrics["train_r2"]) + \
-                "VALIDATION loss: {:.4f}, r2: {:.4f}. ".format(v_metrics["valid_loss"],  v_metrics["valid_r2"]) + \
+                "Epoch {}. TRAIN: loss {:.4f}, r2: {:.4f}. CPC: {:.4f}.".format(
+                    epoch, t_metrics["train_loss"], t_metrics["train_r2"], t_metrics["train_cpc"]
+                    ) + \
+                "VALIDATION loss: {:.4f}, r2: {:.4f}. CPC: {:.4f}.".format(
+                    v_metrics["valid_loss"],  v_metrics["valid_r2"], v_metrics["valid_cpc"]
+                    ) + \
                 "Lr: {:.5f}".format(optimize.param_groups[0]["lr"]), 
             )
             if writer: 
@@ -199,18 +216,38 @@ def train_func(fnn_model, train_loader, valid_loader, epochs, writer=None, outpu
     return fnn_model
 
 
-def val_func(valid_loader, fnn_model, return_y=False):
+def val_func(valid_loader, fnn_model, return_y=False, device='cpu'):
 
     valid_loss = []
     valid_r2 = []
+    valid_cpc = []
     valid_data = next(iter(valid_loader))
+
     with torch.no_grad():
         fnn_model.eval()
-        predict_y = fnn_model(valid_data)
-        valid_loss.append(F.mse_loss(predict_y, valid_data.y))
-        valid_r2.append(r2_loss(predict_y, valid_data.y))
+
+        y = valid_data.y.to(device)
+        x_s = valid_data.x_s.to(device)
+        x_t = valid_data.x_t.to(device)
+        edge_index = valid_data.edge_index.to(device)
+        edge_weight = valid_data.edge_attr.unsqueeze(-1).to(device)
+
+        predict_y = fnn_model(x_s, x_t, edge_index, edge_weight)
+
+        poisson_loss = nn.PoissonNLLLoss(log_input=False)
+        
+        # valid_loss.append(F.mse_loss(predict_y, y))
+        valid_loss.append(poisson_loss(predict_y, y))
+        valid_r2.append(r2_loss(predict_y, y))
+        valid_cpc.append(CPC(y, predict_y))
 
     if return_y:
         return predict_y
     else:
-        return {"valid_loss": np.mean(valid_loss), "valid_r2": np.mean(valid_r2)}
+        valid_loss = [l.cpu() for l in valid_loss]
+        valid_r2 = [r.cpu() for r in valid_r2]
+        return {
+            "valid_loss": np.mean(valid_loss), 
+            "valid_r2": np.mean(valid_r2),
+            "valid_cpc": np.mean(valid_cpc)
+            }
