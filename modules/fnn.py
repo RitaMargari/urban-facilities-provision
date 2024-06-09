@@ -232,6 +232,11 @@ def val_func(valid_loader, fnn_model, return_y=False, device='cpu'):
         edge_index = valid_data.edge_index.to(device)
         edge_weight = valid_data.edge_attr.unsqueeze(-1).to(device)
 
+        mask = (x_s[edge_index[0], 1] != 0) & (x_t[edge_index[1], 1] != 0)
+        y = y[mask]
+        edge_index = edge_index[:, mask]
+        edge_weight = edge_weight[mask]
+
         predict_y = fnn_model(x_s, x_t, edge_index, edge_weight)
 
         poisson_loss = nn.PoissonNLLLoss(log_input=False)

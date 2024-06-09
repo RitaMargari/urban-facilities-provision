@@ -105,7 +105,7 @@ class FNNStack_v2(nn.Module):
 
         self.factors_model = nn.Sequential(
           nn.Linear(5, hidden_dim_2),
-          nn.ReLU(),
+          nn.LeakyReLU(),
           nn.Dropout(p=self.dropout),
           nn.LayerNorm(hidden_dim_2),
           nn.Linear(hidden_dim_2, 1),
@@ -137,11 +137,11 @@ class FNNStack_v2(nn.Module):
             y_sum_i = torch.zeros_like(x_s[:, 1], dtype=y.dtype).index_add_(0, edge_index[0], y)[edge_index[0]].unsqueeze(1)
             y_sum_j = torch.zeros_like(x_t[:, 1], dtype=y.dtype).index_add_(0, edge_index[1], y)[edge_index[1]].unsqueeze(1)
             coef = torch.cat((y.unsqueeze(1), y_sum_i, x_s_d, y_sum_j, x_s_c), axis=1)
-            coef = F.normalize(coef)
+            # coef = F.normalize(coef)
             coef = self.factors_model(coef).squeeze()
             y = y * coef 
 
-        return y * coef
+        return y
     
 
 class FNNStack_v3(nn.Module):
@@ -217,6 +217,7 @@ def train_func(gnn_model, fnn_model, train_loader, valid_loader, epochs, writer=
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimize, factor=0.9, min_lr=0.001)
 
     best_loss = float('inf')
+    best_epoch = 0
     best_gnn_model_state = None
     best_fnn_model_state = None
 
@@ -270,6 +271,7 @@ def train_func(gnn_model, fnn_model, train_loader, valid_loader, epochs, writer=
 
         if v_metrics["valid_loss"] < best_loss:
             best_loss = v_metrics["valid_loss"]
+            best_epoch = epoch
             best_gnn_model_state = copy.deepcopy(gnn_model.state_dict())
             best_fnn_model_state = copy.deepcopy(fnn_model.state_dict())
 
@@ -290,6 +292,7 @@ def train_func(gnn_model, fnn_model, train_loader, valid_loader, epochs, writer=
 
     gnn_model.load_state_dict(best_gnn_model_state if best_gnn_model_state is not None else gnn_model.state_dict())
     fnn_model.load_state_dict(best_fnn_model_state if best_fnn_model_state is not None else fnn_model.state_dict())
+    print("Best_epoch:", best_epoch)
     return [gnn_model, fnn_model]
 
 
